@@ -19,12 +19,17 @@ for f in "$IN_DIR"/region_*_merc_90.tif; do
     echo "--- Processing $region ---"
 
     #########################################################
-    # 1. LAT CUT: skip >= 70°
+    # LAT CUT: skip >= 70°
     #########################################################
-    LATPART=$(echo "$region" | awk -F_ '{print $2}')  # field 2 = +60
-    LAT=${LATPART#+}       # remove +
-    LAT=${LAT#0}           # remove leading zeroes
-    ABSLAT=${LAT#-}        # absolute value
+    LATPART=$(echo "$region" | awk -F_ '{print $2}')
+    LONPART=$(echo "$region" | awk -F_ '{print $3}')
+
+    LAT=${LATPART#+}
+    LAT=${LAT#0}
+    ABSLAT=${LAT#-}
+
+    LON=${LONPART#+}
+    LON=${LON#0}
 
     if [ "$ABSLAT" -ge 70 ]; then
         echo " → Skipping $region (lat >= 70°)"
@@ -32,7 +37,29 @@ for f in "$IN_DIR"/region_*_merc_90.tif; do
     fi
 
     #########################################################
-    # 2. Skip tile if existing PBF is valid
+    # SPECIAL CASE: skip longitude edges near ±180°
+    # because they produce full-width Mercator rasters
+    # (~445k px wide → 40–50 GB arrays → pyhgtmap OOM)
+    #########################################################
+
+    # Skip +180 and -180 exactly
+    if [ "$LON" -eq 180 ] || [ "$LON" -eq -180 ]; then
+        echo " → Skipping $region (lon == ±180°, full-width Mercator tile)"
+        continue
+    fi
+
+    #########################################################
+    # SPECIAL CASE: skip ultra-wide last band at 60°
+    #########################################################
+    # At |lat| = 60° the 170–180° band wraps and produces a
+    # 445k-pixel wide raster (needs ~49 GB RAM). Skip it.
+    if [ "$ABSLAT" -ge 60 ] && [ "$LON" -ge 170 ]; then
+        echo " → Skipping $region (high-latitude last longitude band; would wrap antimeridian)"
+        continue
+    fi
+
+    #########################################################
+    # Skip tile if existing PBF is valid
     #########################################################
     if [ -f "$PBF" ]; then
         SIZE=$(stat -c%s "$PBF" 2>/dev/null || echo 0)
@@ -45,7 +72,7 @@ for f in "$IN_DIR"/region_*_merc_90.tif; do
     fi
 
     #########################################################
-    # 3. Quick empty check
+    # Quick empty check
     #########################################################
     FILESIZE=$(stat -c%s "$f")
     if [ "$FILESIZE" -lt 10000000 ]; then
@@ -54,7 +81,7 @@ for f in "$IN_DIR"/region_*_merc_90.tif; do
     fi
 
     #########################################################
-    # 4. Sample center 100×100 pixels
+    # Sample center 100×100 pixels
     #########################################################
     SIZE=$(gdalinfo "$f" | grep "Size is" | sed 's/.*Size is //;s/,/ /')
     WIDTH=$(echo "$SIZE" | awk '{print $1}')
@@ -80,7 +107,7 @@ for f in "$IN_DIR"/region_*_merc_90.tif; do
     esac
 
     #########################################################
-    # 5. Run pyhgtmap
+    # Run pyhgtmap
     #########################################################
     echo " → Running pyhgtmap (lat=$LATPART) ..."
     pyhgtmap \
@@ -92,7 +119,7 @@ for f in "$IN_DIR"/region_*_merc_90.tif; do
       "$f"
 
     #########################################################
-    # 6. Rename extended pyhgtmap PBF to our canonical name
+    # Rename extended pyhgtmap PBF to our canonical name
     #########################################################
     # pyhgtmap outputs something like:
     #  region_+60_+170_lon...lat....osm.pbf
