@@ -24,12 +24,14 @@ for f in "$IN_DIR"/region_*_merc_90.tif; do
     LATPART=$(echo "$region" | awk -F_ '{print $2}')
     LONPART=$(echo "$region" | awk -F_ '{print $3}')
 
+    # Normalize latitude
     LAT=${LATPART#+}
     LAT=${LAT#0}
     ABSLAT=${LAT#-}
 
-    LON=${LONPART#+}
-    LON=${LON#0}
+    # Normalize longitude safely
+    LON=$(echo "$LONPART" | sed 's/^+//')
+    LON=$(echo "$LON" | sed 's/^\(-\?\)0*/\1/')
 
     if [ "$ABSLAT" -ge 70 ]; then
         echo " → Skipping $region (lat >= 70°)"
@@ -37,24 +39,18 @@ for f in "$IN_DIR"/region_*_merc_90.tif; do
     fi
 
     #########################################################
-    # SPECIAL CASE: skip longitude edges near ±180°
-    # because they produce full-width Mercator rasters
-    # (~445k px wide → 40–50 GB arrays → pyhgtmap OOM)
+    # SKIP ANY WORLD-EDGE LONGITUDE REGION
+    # (this prevents all 445k-wide rasters)
     #########################################################
 
-    # Skip +180 and -180 exactly
-    if [ "$LON" -eq 180 ] || [ "$LON" -eq -180 ]; then
-        echo " → Skipping $region (lon == ±180°, full-width Mercator tile)"
+    if [ "$LON" -ge 170 ] || [ "$LON" -le -170 ]; then
+        echo " → Skipping $region (|lon| >= 170°, full-width Mercator tile)"
         continue
     fi
 
-    #########################################################
-    # SPECIAL CASE: skip ultra-wide last band at 60°
-    #########################################################
-    # At |lat| = 60° the 170–180° band wraps and produces a
-    # 445k-pixel wide raster (needs ~49 GB RAM). Skip it.
-    if [ "$ABSLAT" -ge 60 ] && [ "$LON" -ge 170 ]; then
-        echo " → Skipping $region (high-latitude last longitude band; would wrap antimeridian)"
+    # Redundant explicit check (optional)
+    if [ "$LON" -eq 180 ] || [ "$LON" -eq -180 ]; then
+        echo " → Skipping $region (lon == ±180°)"
         continue
     fi
 
