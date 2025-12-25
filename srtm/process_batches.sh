@@ -1,0 +1,131 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# ---------------- CONFIG ----------------
+BATCH_SIZE=6
+
+LIST_FILE="$HOME/srtm/list.txt"
+BATCH_DIR="$HOME/srtm/batches"
+CHECKPOINT_DIR="$HOME/srtm/checkpoints"
+WORK_ROOT="$HOME/srtm/work"
+
+CONTOURS_DB="contours"
+CONTOUR_INTERVAL=10
+
+export GDAL_NUM_THREADS=ALL_CPUS
+# ----------------------------------------
+
+mkdir -p "$BATCH_DIR" "$CHECKPOINT_DIR" "$WORK_ROOT"
+
+echo "Splitting URL list into batches of $BATCH_SIZE ..."
+split -l "$BATCH_SIZE" -d --additional-suffix=.txt \
+  "$LIST_FILE" "$BATCH_DIR/batch_"
+
+echo "Starting DEM batch processing..."
+
+for BATCH_FILE in "$BATCH_DIR"/batch_*.txt; do
+  BATCH_NAME=$(basename "$BATCH_FILE" .txt)
+  CHECKPOINT_FILE="$CHECKPOINT_DIR/$BATCH_NAME.done"
+  WORK_DIR="$WORK_ROOT/$BATCH_NAME"
+
+  # ---- CHECKPOINT ----
+  if [[ -f "$CHECKPOINT_FILE" ]]; then
+    echo "Skipping $BATCH_NAME (checkpoint exists)"
+    continue
+  fi
+
+  echo
+  echo "===================================================="
+  echo "Processing $BATCH_NAME"
+  echo "===================================================="
+
+  rm -rf "$WORK_DIR"
+  mkdir -p "$WORK_DIR"/{download,extract,tif,pbf}
+
+  # ---- 1) Download ZIPs ----
+  echo "Downloading ZIPs..."
+  while IFS= read -r URL; do
+    [[ -z "$URL" ]] && continue
+    [[ "$URL" =~ ^# ]] && continue
+
+    FILE="$(basename "$URL")"
+    echo "  -> $FILE"
+    wget -q --show-progress -O "$WORK_DIR/download/$FILE" "$URL"
+  done < "$BATCH_FILE"
+
+  # ---- 2) Extract ZIPs ----
+  echo "Extracting..."
+  for ZIP in "$WORK_DIR"/download/*.zip; do
+    unzip -q "$ZIP" -d "$WORK_DIR/extract"
+  done
+
+  # ---- 3) Fill voids & convert HGT → GeoTIFF ----
+  echo "Processing HGT tiles..."
+  mapfile -t HGT_FILES < <(find "$WORK_DIR/extract" -type f -iname "*.hgt" | sort)
+
+  if (( ${#HGT_FILES[@]} == 0 )); then
+    echo "ERROR: No .hgt files found in $BATCH_NAME"
+    exit 1
+  fi
+
+  idx=0
+  for HGT in "${HGT_FILES[@]}"; do
+    idx=$((idx+1))
+    OUT="$WORK_DIR/tif/tile_${idx}.tif"
+
+    gdal_fillnodata.py \
+      "$HGT" \
+      "$OUT"
+  done
+
+  # ---- 4) Mosaic ----
+  echo "Creating mosaic..."
+  gdal_merge.py \
+    -o "$WORK_DIR/raw.tif" \
+    "$WORK_DIR"/tif/*.tif
+
+  # ---- 5) Reproject to spherical Mercator (90 m) ----
+  echo "Reprojecting to spherical Mercator (90 m)..."
+  gdalwarp -multi \
+    --config GDAL_NUM_THREADS ALL_CPUS \
+    -co NUM_THREADS=ALL_CPUS \
+    -co BIGTIFF=YES -co TILED=YES \
+    -co BLOCKXSIZE=256 -co BLOCKYSIZE=256 \
+    -co COMPRESS=ZSTD \
+    -t_srs "+proj=merc +ellps=sphere +R=6378137 +a=6378137 +units=m" \
+    -r bilinear -tr 90 90 \
+    "$WORK_DIR/raw.tif" \
+    "$WORK_DIR/warp-90.tif"
+
+  # ---- 6) Generate contours ----
+  echo "Generating contours..."
+  pyhgtmap \
+    -s "$CONTOUR_INTERVAL" \
+    -0 \
+    --max-nodes-per-tile=0 \
+    --pbf \
+    -o "$WORK_DIR/pbf/contours" \
+    "$WORK_DIR/warp-90.tif"
+
+  # ---- 7) Import into contours DB ----
+  echo "Importing contours into database..."
+  osm2pgsql \
+    --slim \
+    --drop \
+    -d "$CONTOURS_DB" \
+    "$WORK_DIR"/pbf/contours*.pbf
+
+  # ---- 8) CHECKPOINT COMMIT ----
+  touch "$CHECKPOINT_FILE"
+  echo "Checkpoint written: $CHECKPOINT_FILE"
+
+  # ---- 9) Cleanup ----
+  echo "Cleaning up..."
+  rm -rf "$WORK_DIR"
+
+  echo "Batch $BATCH_NAME completed."
+done
+
+echo
+echo "All DEM batches processed successfully."
+
