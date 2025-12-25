@@ -12,6 +12,8 @@ WORK_ROOT="$HOME/srtm/work"
 CONTOURS_DB="contours"
 CONTOUR_INTERVAL=10
 
+HGT_BATCH_SIZE=6
+
 export GDAL_NUM_THREADS=ALL_CPUS
 # ----------------------------------------
 
@@ -40,7 +42,7 @@ for BATCH_FILE in "$BATCH_DIR"/batch_*.txt; do
   echo "===================================================="
 
   rm -rf "$WORK_DIR"
-  mkdir -p "$WORK_DIR"/{download,extract,tif,pbf}
+  mkdir -p "$WORK_DIR"/{download,extract}
 
   # ---- 1) Download ZIPs ----
   echo "Downloading ZIPs..."
@@ -54,76 +56,90 @@ for BATCH_FILE in "$BATCH_DIR"/batch_*.txt; do
   done < "$BATCH_FILE"
 
   # ---- 2) Extract ZIPs ----
-  echo "Extracting..."
+  echo "Extracting ZIPs..."
   for ZIP in "$WORK_DIR"/download/*.zip; do
     unzip -q "$ZIP" -d "$WORK_DIR/extract"
   done
 
-  # ---- 3) Fill voids & convert HGT → GeoTIFF ----
-  echo "Processing HGT tiles..."
-  mapfile -t HGT_FILES < <(find "$WORK_DIR/extract" -type f -iname "*.hgt" | sort)
+  # ---- 3) Collect HGT tiles ----
+  mapfile -t ALL_HGTS < <(find "$WORK_DIR/extract" -type f -iname "*.hgt" | sort)
 
-  if (( ${#HGT_FILES[@]} == 0 )); then
-    echo "ERROR: No .hgt files found in $BATCH_NAME"
+  if (( ${#ALL_HGTS[@]} == 0 )); then
+    echo "ERROR: No HGT files found in $BATCH_NAME"
     exit 1
   fi
 
-  idx=0
-  for HGT in "${HGT_FILES[@]}"; do
-    idx=$((idx+1))
-    OUT="$WORK_DIR/tif/tile_${idx}.tif"
+  echo "Found ${#ALL_HGTS[@]} HGT tiles"
 
-    gdal_fillnodata.py \
-      "$HGT" \
-      "$OUT"
+  # ---- 4) Split into small geographic HGT batches ----
+  HGT_BATCH_DIR="$WORK_DIR/hgt_batches"
+  mkdir -p "$HGT_BATCH_DIR"
+
+  printf "%s\n" "${ALL_HGTS[@]}" | \
+    split -l "$HGT_BATCH_SIZE" -d --additional-suffix=.txt - \
+    "$HGT_BATCH_DIR/hgt_batch_"
+
+  # ---- 5) Process each HGT batch ----
+  for HGT_BATCH in "$HGT_BATCH_DIR"/hgt_batch_*.txt; do
+    SUB_NAME=$(basename "$HGT_BATCH" .txt)
+    SUB_DIR="$WORK_DIR/sub_$SUB_NAME"
+
+    echo "Processing HGT batch $SUB_NAME"
+
+    mkdir -p "$SUB_DIR"/{tif,pbf}
+
+    # -- Fill voids --
+    idx=0
+    while read -r HGT; do
+      idx=$((idx + 1))
+      gdal_fillnodata.py \
+        "$HGT" \
+        "$SUB_DIR/tif/tile_${idx}.tif"
+    done < "$HGT_BATCH"
+
+    # -- Mosaic --
+    gdal_merge.py \
+      -o "$SUB_DIR/raw.tif" \
+      "$SUB_DIR"/tif/*.tif
+
+    # -- Reproject --
+    gdalwarp -multi \
+      --config GDAL_NUM_THREADS ALL_CPUS \
+      -co NUM_THREADS=ALL_CPUS \
+      -co BIGTIFF=YES -co TILED=YES \
+      -co BLOCKXSIZE=256 -co BLOCKYSIZE=256 \
+      -co COMPRESS=ZSTD \
+      -t_srs "+proj=merc +ellps=sphere +R=6378137 +a=6378137 +units=m" \
+      -r bilinear -tr 90 90 \
+      "$SUB_DIR/raw.tif" \
+      "$SUB_DIR/warp-90.tif"
+
+    # -- Contours --
+    pyhgtmap \
+      -s "$CONTOUR_INTERVAL" \
+      -0 \
+      --max-nodes-per-tile=0 \
+      --pbf \
+      -o "$SUB_DIR/pbf/contours" \
+      "$SUB_DIR/warp-90.tif"
+
+    # -- Import --
+    osm2pgsql \
+      --slim \
+      --drop \
+      -d "$CONTOURS_DB" \
+      "$SUB_DIR"/pbf/contours*.pbf
+
+    rm -rf "$SUB_DIR"
   done
 
-  # ---- 4) Mosaic ----
-  echo "Creating mosaic..."
-  gdal_merge.py \
-    -o "$WORK_DIR/raw.tif" \
-    "$WORK_DIR"/tif/*.tif
-
-  # ---- 5) Reproject to spherical Mercator (90 m) ----
-  echo "Reprojecting to spherical Mercator (90 m)..."
-  gdalwarp -multi \
-    --config GDAL_NUM_THREADS ALL_CPUS \
-    -co NUM_THREADS=ALL_CPUS \
-    -co BIGTIFF=YES -co TILED=YES \
-    -co BLOCKXSIZE=256 -co BLOCKYSIZE=256 \
-    -co COMPRESS=ZSTD \
-    -t_srs "+proj=merc +ellps=sphere +R=6378137 +a=6378137 +units=m" \
-    -r bilinear -tr 90 90 \
-    "$WORK_DIR/raw.tif" \
-    "$WORK_DIR/warp-90.tif"
-
-  # ---- 6) Generate contours ----
-  echo "Generating contours..."
-  pyhgtmap \
-    -s "$CONTOUR_INTERVAL" \
-    -0 \
-    --max-nodes-per-tile=0 \
-    --pbf \
-    -o "$WORK_DIR/pbf/contours" \
-    "$WORK_DIR/warp-90.tif"
-
-  # ---- 7) Import into contours DB ----
-  echo "Importing contours into database..."
-  osm2pgsql \
-    --slim \
-    --drop \
-    -d "$CONTOURS_DB" \
-    "$WORK_DIR"/pbf/contours*.pbf
-
-  # ---- 8) CHECKPOINT COMMIT ----
+  # ---- CHECKPOINT COMMIT ----
   touch "$CHECKPOINT_FILE"
   echo "Checkpoint written: $CHECKPOINT_FILE"
 
-  # ---- 9) Cleanup ----
-  echo "Cleaning up..."
+  # ---- Cleanup batch workspace ----
   rm -rf "$WORK_DIR"
 
-  echo "Batch $BATCH_NAME completed."
 done
 
 echo
