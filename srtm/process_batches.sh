@@ -2,12 +2,13 @@
 set -euo pipefail
 
 # ---------------- CONFIG ----------------
-BATCH_SIZE=6
+BATCH_SIZE=1
 
-LIST_FILE="$HOME/srtm/list.txt"
+LIST_FILE="$HOME/srtm/list_europe.txt"
 BATCH_DIR="$HOME/srtm/batches"
 CHECKPOINT_DIR="$HOME/srtm/checkpoints"
 WORK_ROOT="$HOME/srtm/work"
+ERROR_LOG="$HOME/srtm/error_$(date +%Y%m%d_%H%M%S).log"
 
 CONTOURS_DB="contours"
 CONTOUR_INTERVAL=10
@@ -81,12 +82,14 @@ for BATCH_FILE in "$BATCH_DIR"/batch_*.txt; do
 
   # ---- 5) Process each HGT batch ----
   for HGT_BATCH in "$HGT_BATCH_DIR"/hgt_batch_*.txt; do
-    SUB_NAME=$(basename "$HGT_BATCH" .txt)
-    SUB_DIR="$WORK_DIR/sub_$SUB_NAME"
+  SUB_NAME=$(basename "$HGT_BATCH" .txt)
+  SUB_DIR="$WORK_DIR/sub_$SUB_NAME"
 
-    echo "Processing HGT batch $SUB_NAME"
+  echo "Processing HGT batch $SUB_NAME"
+  mkdir -p "$SUB_DIR"/{tif,pbf}
 
-    mkdir -p "$SUB_DIR"/{tif,pbf}
+  (
+    set -e  # fail inside this subshell only
 
     # -- Fill voids --
     idx=0
@@ -129,9 +132,17 @@ for BATCH_FILE in "$BATCH_DIR"/batch_*.txt; do
       --drop \
       -d "$CONTOURS_DB" \
       "$SUB_DIR"/pbf/contours*.pbf
+  ) || {
+    echo "$(date) ERROR in $BATCH_NAME / $SUB_NAME" >> "$ERROR_LOG"
+    echo "  ZIP: $(cat "$BATCH_FILE")" >> "$ERROR_LOG"
+    echo "  HGT batch:" >> "$ERROR_LOG"
+    cat "$HGT_BATCH" >> "$ERROR_LOG"
+    echo "----------------------------------------" >> "$ERROR_LOG"
+  }
 
-    rm -rf "$SUB_DIR"
+  rm -rf "$SUB_DIR"
   done
+
 
   # ---- CHECKPOINT COMMIT ----
   touch "$CHECKPOINT_FILE"
